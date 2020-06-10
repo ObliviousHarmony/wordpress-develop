@@ -95,7 +95,7 @@ class MockAction {
 
 		$args           = func_get_args();
 		$this->events[] = array(
-			'filter' => __FUNCTION__,
+			'action' => __FUNCTION__,
 			'tag'    => $this->current_filter(),
 			'args'   => $args,
 		);
@@ -109,7 +109,7 @@ class MockAction {
 
 		$args           = func_get_args();
 		$this->events[] = array(
-			'filter' => __FUNCTION__,
+			'action' => __FUNCTION__,
 			'tag'    => $this->current_filter(),
 			'args'   => $args,
 		);
@@ -149,11 +149,11 @@ class MockAction {
 	}
 
 	// Return a count of the number of times the action was called since the last reset.
-	function get_call_count( $tag = '' ) {
-		if ( $tag ) {
+	function get_call_count( $action = '' ) {
+		if ( $action ) {
 			$count = 0;
 			foreach ( $this->events as $e ) {
-				if ( $e['action'] === $tag ) {
+				if ( $e['action'] === $action ) {
 					++$count;
 				}
 			}

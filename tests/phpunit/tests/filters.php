@@ -133,13 +133,13 @@ class Tests_Filters extends WP_UnitTestCase {
 		$expected = array(
 			// 'filter2' is called first because it has priority 9.
 			array(
-				'filter' => 'filter2',
+				'action' => 'filter2',
 				'tag'    => $tag,
 				'args'   => array( $val ),
 			),
 			// 'filter' is called second.
 			array(
-				'filter' => 'filter',
+				'action' => 'filter',
 				'tag'    => $tag,
 				'args'   => array( $val ),
 			),
