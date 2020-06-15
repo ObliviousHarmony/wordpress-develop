@@ -40,6 +40,7 @@ function strip_ws( $txt ) {
 class MockAction {
 	var $events;
 	var $debug;
+	var $filter_return_vals;
 
 	/**
 	 * PHP5 constructor.
@@ -50,7 +51,12 @@ class MockAction {
 	}
 
 	function reset() {
-		$this->events = array();
+		$this->events             = array();
+		$this->filter_return_vals = array();
+	}
+
+	function add_filter_response( $action, $filter, $return_val ) {
+		$this->filter_return_vals[ $action ][ $filter ] = $return_val;
 	}
 
 	function current_filter() {
@@ -99,6 +105,11 @@ class MockAction {
 			'tag'    => $this->current_filter(),
 			'args'   => $args,
 		);
+
+		if ( isset( $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ] ) ) {
+			return $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ];
+		}
+
 		return $arg;
 	}
 
@@ -113,6 +124,11 @@ class MockAction {
 			'tag'    => $this->current_filter(),
 			'args'   => $args,
 		);
+
+		if ( isset( $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ] ) ) {
+			return $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ];
+		}
+
 		return $arg;
 	}
 
@@ -123,10 +139,15 @@ class MockAction {
 
 		$args           = func_get_args();
 		$this->events[] = array(
-			'filter' => __FUNCTION__,
+			'action' => __FUNCTION__,
 			'tag'    => $this->current_filter(),
 			'args'   => $args,
 		);
+
+		if ( isset( $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ] ) ) {
+			return $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ];
+		}
+
 		return $arg . '_append';
 	}
 
@@ -137,10 +158,15 @@ class MockAction {
 		}
 
 		$this->events[] = array(
-			'filter' => __FUNCTION__,
+			'action' => __FUNCTION__,
 			'tag'    => $tag,
 			'args'   => $args,
 		);
+
+		// Although this filter isn't supposed to return a value, let's have this to be consistent.
+		if ( isset( $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ] ) ) {
+			return $this->filter_return_vals[ __FUNCTION__ ][ $this->current_filter() ];
+		}
 	}
 
 	// Return a list of all the actions, tags and args.

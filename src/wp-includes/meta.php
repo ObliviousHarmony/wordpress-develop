@@ -136,6 +136,181 @@ function add_metadata( $meta_type, $object_id, $meta_key, $meta_value, $unique =
 }
 
 /**
+ * Adds metadata for the specified objects. Note: Due to inconsistencies with AUTO_INCREMENT behavior in different
+ * database engines and configurations, this function does NOT perform a bulk insertion query.
+ *
+ * @since 5.6.0
+ *
+ * @global wpdb $wpdb WordPress database abstraction object.
+ *
+ * @param string $meta_type        Type of object metadata is for. Accepts 'post', 'comment', 'term', 'user',
+ *                                 or any other object type with an associated meta data.
+ * @param array  $metadata         This is an associative multi-dimensional array. The topmost array holds the metadata
+ *                                 to create indexed by the ID of the object it should be associated with. The inner
+ *                                 array is of meta_value indexed by the slashed meta_key. Must be serializable if non-scalar.
+ * @param array  $unique_meta_keys Optional. The slashed meta keys that should be unique for the object.
+ *                                 If a specified key already has a value for the object, no
+ *                                 change will be made. Default empty.
+ * @return array A multi-dimensional array containing the IDs of all of the metadata we've created. The topmost array
+ *               is indexed by the ID of the object. The value is another array containing either false or the ID of the
+ *               metadata indexed by the slashed meta_key from the input array.
+ */
+function add_bulk_metadata( $meta_type, $metadata, $unique_meta_keys = array() ) {
+	global $wpdb;
+
+	$ret = array();
+
+	if ( ! $meta_type || empty( $metadata ) ) {
+		return $ret;
+	}
+
+	/**
+	 * Filters whether to add bulk metadata of a specific type.
+	 *
+	 * The dynamic portion of the hook, `$meta_type`, refers to the meta
+	 * object type (comment, post, term, or user). Returning a non-null value
+	 * will effectively short-circuit the function.
+	 *
+	 * @since 5.6.0
+	 *
+	 * @param null|array $check            Whether to allow adding metadata for the given type.
+	 * @param array      $metadata         This is an associative multi-dimensional array. The topmost array holds the metadata
+	 *                                     to create indexed by the ID of the object it should be associated with. The metadata
+	 *                                     itself is an array indexed by the slashed meta_key with a value of the slashed meta_value.
+	 * @param array      $unique_meta_keys The slashed meta keys that should be unique for each object.
+	 */
+	$check = apply_filters( "add_bulk_{$meta_type}_metadata", null, $metadata, $unique_meta_keys );
+	if ( null !== $check ) {
+		return $check;
+	}
+
+	$table = _get_meta_table( $meta_type );
+	if ( ! $table ) {
+		return $ret;
+	}
+	$column = sanitize_key( $meta_type . '_id' );
+
+	// Check and convert all of the object IDs so that we can use them safely in queries later.
+	$object_ids = array();
+	foreach ( $metadata as $input_object_id => $object_metadata ) {
+		$object_id = 0;
+		if ( is_numeric( $input_object_id ) ) {
+			$object_id = absint( $input_object_id );
+		}
+		if ( ! $object_id ) {
+			foreach ( $object_metadata as $input_meta_key => $meta_value ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = false;
+			}
+			continue;
+		}
+
+		$object_ids[ $input_object_id ] = $object_id;
+	}
+
+	if ( count( $metadata ) === count( $ret ) ) {
+		return $ret;
+	}
+
+	// We can avoid doing a bunch of unique key checks by grabbing all of the existing entries the objects in
+	// a single query and then checking everything before the insertion.
+	$existing_unique = array();
+	if ( ! empty( $unique_meta_keys ) ) {
+		$prepared_unique_keys = array();
+		foreach ( $unique_meta_keys as $unique_meta_key ) {
+			$prepared_unique_keys[] = $wpdb->prepare( '%s', wp_unslash( $unique_meta_key ) );
+		}
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results(
+			sprintf(
+				"SELECT $column, meta_key FROM $table WHERE meta_key IN (%s) AND $column IN (%s) GROUP BY $column, meta_key",
+				implode( ',', $prepared_unique_keys ),
+				implode( ',', $object_ids )
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared
+
+		foreach ( $rows as $row ) {
+			$existing_unique[ $row->{$column} ][ $row->meta_key ] = $row->meta_key;
+		}
+
+		unset( $prepared_unique_keys );
+		unset( $rows );
+	}
+
+	// Note: Be careful to only index the $ret array using the same keys in the input array so that
+	// consumers can reliably access the success statuses of individual meta entries.
+	foreach ( $metadata as $input_object_id => $object_metadata ) {
+		// Since we've already sanitized all of the IDs we can assume a missing one is a failure.
+		if ( ! isset( $object_ids[ $input_object_id ] ) ) {
+			continue;
+		}
+		$object_id = $object_ids[ $input_object_id ];
+
+		$meta_subtype = get_object_subtype( $meta_type, $object_id );
+
+		foreach ( $object_metadata as $input_meta_key => $meta_value ) {
+			$meta_key   = wp_unslash( $input_meta_key );
+			$meta_value = wp_unslash( $meta_value );
+			$meta_value = sanitize_meta( $meta_key, $meta_value, $meta_type, $meta_subtype );
+			$unique     = in_array( $input_meta_key, $unique_meta_keys, true );
+
+			/** This filter is documented in wp-includes/meta.php */
+			$check = apply_filters( "add_{$meta_type}_metadata", null, $object_id, $meta_key, $meta_value, $unique );
+			if ( null !== $check ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = $check;
+				continue;
+			}
+
+			if ( isset( $existing_unique[ $object_id ][ $meta_key ] ) ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = false;
+				continue;
+			}
+
+			/** This action is documented in wp-includes/meta.php */
+			do_action( "add_{$meta_type}_meta", $object_id, $meta_key, $meta_value );
+
+			// We need to do the insertions one-by-one in order to be backwards compatible with add_metadata().
+			// This is because there is no way to perform an 'INSERT INTO ... VALUES ()' query in a way that
+			// we can consistently assume the inserted IDs of every metadata entry. The LAST_INSERTED_ID()
+			// will contain the first ID inserted and in certain deployments this is enough, but due to
+			// how hard bugs here would be to diagnose, it is better to let the short-circuit filter
+			// be used when more assumptions can be made.
+			$result = $wpdb->insert(
+				$table,
+				array(
+					$column      => $object_id,
+					'meta_key'   => $meta_key,
+					'meta_value' => maybe_serialize( $meta_value ),
+				)
+			);
+
+			if ( ! $result ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = false;
+			} else {
+				$ret[ $input_object_id ][ $input_meta_key ] = (int) $wpdb->insert_id;
+			}
+		}
+
+		wp_cache_delete( $object_id, $meta_type . '_meta' );
+
+		// We need to run this action after AFTER clearing the cache. Instead of repeatedly clearing it after every
+		// insert, it would be best to wait until after all of the insertions have completed for an object.
+		foreach ( $ret[ $input_object_id ] as $meta_key => $mid ) {
+			$meta_value = $object_metadata[ $meta_key ];
+			if ( ! $meta_value ) {
+				continue;
+			}
+
+			/** This action is documented in wp-includes/meta.php */
+			do_action( "added_{$meta_type}_meta", $mid, $object_id, $meta_key, $meta_value );
+		}
+	}
+
+	return $ret;
+}
+
+/**
  * Updates metadata for the specified object. If no value already exists for the specified object
  * ID and metadata key, the metadata will be added.
  *
