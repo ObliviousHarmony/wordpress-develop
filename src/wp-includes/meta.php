@@ -961,6 +961,128 @@ function get_metadata( $meta_type, $object_id, $meta_key = '', $single = false )
 }
 
 /**
+ * Retrieves metadata for a number of objects.
+ *
+ * @since 4.6.0
+ *
+ * @param string $meta_type Type of object metadata is for. Accepts 'post', 'comment', 'term', 'user',
+ *                          or any other object type with an associated meta table.
+ * @param array  $metadata  This is an associative multi-dimensional array. The topmost array holds the slashed meta
+ *                          keys to get indexed by the ID of the object it is associated with.
+ * @param bool   $single    Optional. If true, return only the first value of the specified meta_key.
+ *                          This parameter has no effect if meta_key is not specified. Default false.
+ * @return mixed An associative multi-dimensional array. The topmost array holds the desired metadata indexed by the
+ *               ID of the object that it is associated with. The inner array contains either single or multiple
+ *               meta values indexed by the input meta key.
+ */
+function get_bulk_metadata( $meta_type, $metadata, $single = false ) {
+	global $wpdb;
+
+	$ret = array();
+
+	if ( ! $meta_type || empty( $metadata ) ) {
+		return $ret;
+	}
+
+	/**
+	 * Filters whether to retrieve metadata of a specific type.
+	 *
+	 * The dynamic portion of the hook, `$meta_type`, refers to the meta
+	 * object type (comment, post, term, or user). Returning a non-null value
+	 * will effectively short-circuit the function.
+	 *
+	 * @since 5.6.0
+	 * @param null|array|string $value    The value get_bulk_metadata() should return.
+	 * @param array             $metadata This is an associative multi-dimensional array. The topmost array holds the slashed meta
+	 *                                    keys to get indexed by the ID of the object it is associated with.
+	 */
+	$check = apply_filters( "get_bulk_{$meta_type}_metadata", null, $metadata );
+	if ( null !== $check ) {
+		return $check;
+	}
+
+	// Process all of the input object IDs so we can just use internal bulk caching functions for simplicity.
+	$object_ids      = array();
+	$objects_to_load = array();
+	$meta_caches     = array();
+	foreach ( $metadata as $input_object_id => $object_meta_keys ) {
+		$object_id = 0;
+		if ( is_numeric( $input_object_id ) ) {
+			$object_id = absint( $input_object_id );
+		}
+		if ( ! $object_id ) {
+			foreach ( $object_meta_keys as $input_meta_key ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = false;
+			}
+			continue;
+		}
+		$object_ids[ $input_object_id ] = $object_id;
+
+		foreach ( $object_meta_keys as $input_meta_key ) {
+			/** This filter is documented in wp-includes/meta.php */
+			$check = apply_filters( "get_{$meta_type}_metadata", null, $object_id, $input_meta_key, $single );
+			if ( null !== $check ) {
+				if ( $single && is_array( $check ) ) {
+					$ret[ $input_object_id ][ $input_meta_key ] = $check[0];
+				} else {
+					$ret[ $input_object_id ][ $input_meta_key ] = $check;
+				}
+			}
+		}
+
+		// If we've short-circuited all of them then we have nothing to do with this object.
+		if ( isset( $ret[ $input_object_id ] ) && count( $object_meta_keys ) === count( $ret[ $input_object_id ] ) ) {
+			continue;
+		}
+
+		$meta_caches[ $input_object_id ] = wp_cache_get( $object_id, $meta_type . '_meta' );
+		if ( empty( $meta_cache[ $input_object_id ] ) ) {
+			$objects_to_load[] = $object_id;
+		}
+	}
+
+	// Bulk update the entire cache for these objects so we can just fetch them easily.
+	if ( ! empty( $objects_to_load ) ) {
+		$updated_caches = update_meta_cache( $meta_type, $objects_to_load );
+	}
+
+	foreach ( $object_ids as $input_object_id => $object_id ) {
+		if ( ! empty( $meta_caches[ $input_object_id ] ) ) {
+			$meta_cache = $meta_caches[ $input_object_id ];
+		} elseif ( ! empty( $updated_caches[ $object_id ] ) ) {
+			$meta_cache = $updated_caches[ $object_id ];
+		} else {
+			$meta_cache = null;
+		}
+
+		foreach ( $metadata[ $input_object_id ] as $input_meta_key ) {
+			// We should skip those that were short-circuited.
+			if ( isset( $ret[ $input_object_id ][ $input_meta_key ] ) ) {
+				continue;
+			}
+
+			$meta_key = wp_unslash( $input_meta_key );
+
+			if ( isset( $meta_cache[ $meta_key ] ) && $meta_cache[ $meta_key ] ) {
+				if ( $single ) {
+					$ret[ $input_object_id ][ $input_meta_key ] = maybe_unserialize( $meta_cache[ $meta_key ][0] );
+				} else {
+					$ret[ $input_object_id ][ $input_meta_key ] = array_map( 'maybe_unserialize', $meta_cache[ $meta_key ] );
+				}
+			} else {
+				if ( $single ) {
+					$ret[ $input_object_id ][ $input_meta_key ] = '';
+				} else {
+					$ret[ $input_object_id ][ $input_meta_key ] = array();
+				}
+			}
+		}
+	}
+
+	return $ret;
+}
+
+/**
  * Determines if a meta key is set for a given object.
  *
  * @since 3.3.0
