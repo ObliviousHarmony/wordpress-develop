@@ -649,6 +649,240 @@ function delete_metadata( $meta_type, $object_id, $meta_key, $meta_value = '', $
 }
 
 /**
+ * Deletes metadata for the specified objects.
+ *
+ * @since 5.6.0
+ *
+ * @global wpdb $wpdb WordPress database abstraction object.
+ *
+ * @param string $meta_type Type of object metadata is for. Accepts 'post', 'comment', 'term', 'user',
+ *                          or any other object type with an associated meta data.
+ * @param array  $metadata  This is an associative multi-dimensional array. The topmost array holds the metadata
+ *                          to delete indexed by the ID of the object it is associated with. The inner array
+ *                          contains the optional meta values to delete indexed by the meta keys to delete. If a
+ *                          non-empty value is set then it will only delete entries with this value, otherwise it
+ *                          will delete all values with the key. Set the value to `null`, `false`, or an empty
+ *                          string to skip this check. (For backward compatibility, it is not possible to pass an
+ *                          empty string to delete those entries with an empty string for the value.
+ * @return array An associative multi-dimensional array. The topmost array holds the results of the deletion indexed by
+ *               the object ID. The inner array contains the boolean success status for each deletion indexed by the
+ *               meta key that was deleted.
+ */
+function delete_bulk_metadata( $meta_type, $metadata ) {
+	global $wpdb;
+
+	$ret = array();
+
+	if ( ! $meta_type || empty( $metadata ) ) {
+		return $ret;
+	}
+
+	/**
+	 * Filters whether to delete bulk metadata of a specific type.
+	 *
+	 * The dynamic portion of the hook, `$meta_type`, refers to the meta
+	 * object type (comment, post, term, or user). Returning a non-null value
+	 * will effectively short-circuit the function.
+	 *
+	 * @since 5.6.0
+	 *
+	 * @param null|array $check            Whether to allow adding metadata for the given type.
+	 * @param array      $metadata         This is an associative multi-dimensional array. The topmost array holds the metadata
+	 *                                     to delete indexed by the ID of the object it is associated with. The inner array
+	 *                                     contains the optional meta values to delete indexed by the meta keys to delete. If a
+	 *                                     non-empty value is set then it will only delete entries with this value, otherwise it
+	 *                                     will delete all values with the key. Set the value to `null`, `false`, or an empty
+	 *                                     string to skip this check. (For backward compatibility, it is not possible to pass an
+	 *                                     empty string to delete those entries with an empty string for the value.
+	 */
+	$check = apply_filters( "delete_bulk_{$meta_type}_metadata", null, $metadata );
+	if ( null !== $check ) {
+		return $check;
+	}
+
+	$table = _get_meta_table( $meta_type );
+	if ( ! $table ) {
+		return $ret;
+	}
+
+	// Check and convert all of the object IDs so that we can use them safely in queries later.
+	$object_ids                   = array();
+	$unslashed_meta_keys_to_input = array();
+	foreach ( $metadata as $input_object_id => $object_metadata ) {
+		$object_id = 0;
+		if ( is_numeric( $input_object_id ) ) {
+			$object_id = absint( $input_object_id );
+		}
+		if ( ! $object_id ) {
+			foreach ( $object_metadata as $input_meta_key => $meta_value ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = false;
+			}
+			continue;
+		}
+
+		$object_ids[ $input_object_id ] = $object_id;
+
+		// Since we're going to be iterating over the SELECT results, we need to create a mapping from the
+		// unslashed input key back to the original key in order to deal with cases where unslashing the
+		// meta key will result in something different than the $input_meta_key. e.x. \/foo -> /foo.
+		foreach ( $object_metadata as $input_meta_key => $meta_value ) {
+			$unslashed_meta_keys_to_input[ $input_object_id ][ wp_unslash( $input_meta_key ) ] = $input_meta_key;
+		}
+	}
+
+	if ( count( $metadata ) === count( $ret ) ) {
+		return $ret;
+	}
+
+	$type_column = sanitize_key( $meta_type . '_id' );
+	$id_column   = ( 'user' === $meta_type ) ? 'umeta_id' : 'meta_id';
+
+	$meta_queries = array();
+	foreach ( $metadata as $input_object_id => $object_metadata ) {
+		// Since we've already sanitized all of the IDs we can assume a missing one is invalid.
+		if ( ! isset( $object_ids[ $input_object_id ] ) ) {
+			continue;
+		}
+		$object_id = $object_ids[ $input_object_id ];
+
+		$object_query = array();
+		foreach ( $object_metadata as $input_meta_key => $meta_value ) {
+			$meta_key   = wp_unslash( $input_meta_key );
+			$meta_value = wp_unslash( $meta_value );
+
+			/** This filter is documented in wp-includes/meta.php */
+			$check = apply_filters( "delete_{$meta_type}_metadata", null, $object_id, $meta_key, $meta_value, false );
+			if ( null !== $check ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = $check;
+				continue;
+			}
+
+			$object_query[] = $wpdb->prepare( '%s', $meta_key );
+		}
+
+		if ( empty( $object_query ) ) {
+			continue;
+		}
+
+		$meta_queries[] = sprintf(
+			"$type_column = %d AND meta_key IN (%s)",
+			$object_id,
+			implode( ',', $object_query )
+		);
+	}
+
+	if ( empty( $meta_queries ) ) {
+		return $ret;
+	}
+
+	$meta_queries = implode( ' OR ', $meta_queries );
+
+	// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+	$rows = $wpdb->get_results( "SELECT $id_column, $type_column, meta_key, meta_value FROM $table WHERE $meta_queries" );
+	// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+	unset( $meta_queries );
+
+	// Since we support value-specific deletions, we need to be careful with the actual deletion. To deal with this
+	// in a performant way we can select all of the possibly applicable meta IDs and their values and remove only
+	// those that fit the criteria.
+	$input_object_ids = array_flip( $object_ids );
+	$mids_to_delete   = array();
+	foreach ( $rows as $row ) {
+		if ( ! isset( $input_object_ids[ $row->{$type_column} ] ) ) {
+			continue;
+		}
+		$input_object_id = $input_object_ids[ $row->{$type_column} ];
+
+		// Use the conversion map we created earlier to get the input meta key.
+		// This is needed to deal with cases where the input meta key cannot
+		// be recovered after being unslashed.
+		$input_meta_key = $unslashed_meta_keys_to_input[ $input_object_id ][ $row->meta_key ];
+		if ( ! array_key_exists( $input_meta_key, $metadata[ $input_object_id ] ) ) {
+			continue;
+		}
+
+		// We need to check the value because we may have pulled records that don't fit the deletion criteria.
+		$meta_value = maybe_serialize( wp_unslash( $metadata[ $input_object_id ][ $input_meta_key ] ) );
+		if ( null !== $meta_value && false !== $meta_value && '' !== $meta_value && $meta_value !== $row->meta_value ) {
+			$ret[ $input_object_id ][ $input_meta_key ] = false;
+			continue;
+		}
+
+		// Sort all of the IDs so we can call the appropriate actions before the deletion.
+		$mids_to_delete[ $input_object_id ][ $input_meta_key ][] = $row->{$id_column};
+	}
+	unset( $input_object_ids );
+	unset( $rows );
+
+	foreach ( $mids_to_delete as $input_object_id => $object_mids ) {
+		foreach ( $object_mids as $input_meta_key => $meta_ids ) {
+			$object_id  = $object_ids[ $input_object_id ];
+			$meta_key   = wp_unslash( $input_meta_key );
+			$meta_value = $metadata[ $input_object_id ][ $input_meta_key ];
+
+			/** This action is documented in wp-includes/meta.php */
+			do_action( "delete_{$meta_type}_meta", $meta_ids, $object_id, $meta_key, $meta_value );
+
+			// Old-style action.
+			if ( 'post' === $meta_type ) {
+				/** This action is documented in wp-includes/meta.php */
+				do_action( 'delete_postmeta', $meta_ids );
+			}
+
+			// We are going to perform the deletions one-at-a-time in order to be consistent with the return
+			// value of `delete_metadata` in the return array. Since that function checks the deletion count
+			// we can only replicate it in this way.
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared
+			$count = $wpdb->query(
+				sprintf(
+					"DELETE FROM $table WHERE $id_column IN (%s)",
+					implode( ',', $meta_ids )
+				)
+			);
+			// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared
+
+			if ( ! $count ) {
+				$ret[ $input_object_id ][ $input_meta_key ] = false;
+				continue;
+			}
+			$ret[ $input_object_id ][ $input_meta_key ] = true;
+
+			wp_cache_delete( $object_id, $meta_type . '_meta' );
+
+			/**
+			 * Fires immediately after deleting metadata of a specific type.
+			 *
+			 * The dynamic portion of the hook name, `$meta_type`, refers to the meta
+			 * object type (comment, post, term, or user).
+			 *
+			 * @since 2.9.0
+			 *
+			 * @param string[] $meta_ids    An array of metadata entry IDs to delete.
+			 * @param int      $object_id   ID of the object metadata is for.
+			 * @param string   $meta_key    Metadata key.
+			 * @param mixed    $_meta_value Metadata value. Serialized if non-scalar.
+			 */
+			do_action( "deleted_{$meta_type}_meta", $meta_ids, $object_id, $meta_key, $meta_value );
+
+			// Old-style action.
+			if ( 'post' === $meta_type ) {
+				/**
+				 * Fires immediately after deleting metadata for a post.
+				 *
+				 * @since 2.9.0
+				 *
+				 * @param string[] $meta_ids An array of metadata entry IDs to delete.
+				 */
+				do_action( 'deleted_postmeta', $meta_ids );
+			}
+		}
+	}
+
+	return $ret;
+}
+
+/**
  * Retrieves metadata for the specified object.
  *
  * @since 2.9.0
